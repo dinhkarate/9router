@@ -377,10 +377,11 @@ async function peekFirstQoderFrame(reader, decoder) {
 
     let envelope;
     try { envelope = JSON.parse(data); } catch { return { isBilling: false, consumed }; }
-
     const statusVal = typeof envelope.statusCodeValue === "number" ? envelope.statusCodeValue : 200;
-    const inner = typeof envelope.body === "string" ? envelope.body : "";
-
+    // Same extraction as processLine: body may be a JSON string or an object.
+    const inner = typeof envelope.body === "string"
+      ? envelope.body
+      : envelope.body != null ? JSON.stringify(envelope.body) : "";
     if (statusVal !== 200 && isBillingBlock(inner)) {
       return { isBilling: true, statusVal, message: inner || `qoder billing block (${statusVal})` };
     }
@@ -461,6 +462,25 @@ async function wrapQoderSSE(response, model) {
       ? envelope.body
       : envelope.body != null ? JSON.stringify(envelope.body) : "";
     if (statusVal !== 200) {
+      if (isBillingBlock(inner)) {
+        // Billing/quota envelope at any stream position (peek only covers the
+        // first frame): emit a structured error chunk, not fake assistant text.
+        // parseSSEToOpenAIResponse understands chunk.error and turns it into a
+        // non-200 result so chat.js locks the model and falls back. Streaming
+        // clients receive a real SSE error instead of "[qoder error ...]" text.
+        const errObj = JSON.stringify({
+          error: {
+            message: inner || `qoder billing block (${statusVal})`,
+            code: "qoder_billing_block",
+            status: 403,
+            type: "quota_error",
+          },
+        });
+        controller.enqueue(encoder.encode(`data: ${errObj}\n\n`));
+        controller.enqueue(encoder.encode(SSE_DONE));
+        doneEmitted = true;
+        return;
+      }
       const msg = inner || `upstream status ${statusVal}`;
       const errChunk = JSON.stringify({
         id: `qoder-error-${Date.now()}`,
