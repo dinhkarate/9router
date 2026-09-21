@@ -462,10 +462,10 @@ async function wrapQoderSSE(response, model, log = null) {
       ? envelope.body
       : envelope.body != null ? JSON.stringify(envelope.body) : "";
     if (statusVal !== 200) {
-      // Debug the exact upstream envelope shape (types vary: numeric vs string
-        // status, string vs object body). Response bodies carry no credentials.
+      // Always visible: error envelopes are rare and worth one stderr line at
+        // any log level (response bodies carry no credentials).
       try {
-        log?.debug?.("QODER", `error envelope status=${statusVal} statusType=${typeof envelope.statusCodeValue} bodyType=${typeof envelope.body} body=${truncate(inner, 300)}`);
+        console.error(`[QODER] error envelope status=${statusVal} statusType=${typeof envelope.statusCodeValue} bodyType=${typeof envelope.body} body=${truncate(inner, 300)}`);
       } catch { /* logging must not break the stream */ }
       if (isBillingBlock(inner)) {
         // Billing/quota envelope at any stream position (peek only covers the
