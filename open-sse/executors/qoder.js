@@ -354,6 +354,19 @@ function isBillingBlock(inner) {
 }
 
 /**
+ * Structured provider error for Qoder billing/quota blocks.
+ * Carries the real upstream status (403) so chat.js applies model lock and
+ * account fallback. The message preserves the raw upstream body for diagnosis.
+ */
+function billingError(message, statusVal = 403) {
+  const err = new Error(message || `qoder billing block (${statusVal})`);
+  err.name = "QoderBillingError";
+  err.status = 403;
+  err.code = "qoder_billing_block";
+  err.provider = "qoder";
+  return err;
+}
+/**
  * Peek the first SSE frame to detect billing errors before piping.
  * Returns { isBilling, statusVal, message, consumed } — `consumed` is every
  * byte read so far (including the peeked line) so the caller can re-process
@@ -422,12 +435,12 @@ async function wrapQoderSSE(response, model, log = null) {
   // Peek first frame to detect billing block
   const peek = await peekFirstQoderFrame(reader, decoder);
   if (peek?.isBilling) {
-    // Billing block detected — return 403 so chatCore fails this connection
+    // Billing block detected — throw a structured provider error carrying the
+    // real upstream status. chatCore's execute try/catch converts a throw into
+    // a non-200 result (never HTTP 200 assistant text), so chat.js locks the
+    // model and falls back to the next account.
     await reader.cancel().catch(() => {});
-    return new Response(
-      JSON.stringify({ error: { message: peek.message, code: peek.statusVal } }),
-      { status: 403, headers: { "Content-Type": "application/json" } }
-    );
+    throw billingError(peek.message, peek.statusVal);
   }
 
   // Normal flow: re-process every byte the peek consumed, then continue.
@@ -454,7 +467,6 @@ async function wrapQoderSSE(response, model, log = null) {
       syncDone();
       return;
     }
-
     let envelope;
     try { envelope = JSON.parse(data); } catch { return; }
     const statusVal = Number(envelope.statusCodeValue) || 200;
@@ -462,29 +474,13 @@ async function wrapQoderSSE(response, model, log = null) {
       ? envelope.body
       : envelope.body != null ? JSON.stringify(envelope.body) : "";
     if (statusVal !== 200) {
-      // Always visible: error envelopes are rare and worth one stderr line at
-        // any log level (response bodies carry no credentials).
-      try {
-        console.error(`[QODER] error envelope status=${statusVal} statusType=${typeof envelope.statusCodeValue} bodyType=${typeof envelope.body} body=${truncate(inner, 300)}`);
-      } catch { /* logging must not break the stream */ }
       if (isBillingBlock(inner)) {
-        // Billing/quota envelope at any stream position (peek only covers the
-        // first frame): emit a structured error chunk, not fake assistant text.
-        // parseSSEToOpenAIResponse understands chunk.error and turns it into a
-        // non-200 result so chat.js locks the model and falls back. Streaming
-        // clients receive a real SSE error instead of "[qoder error ...]" text.
-        const errObj = JSON.stringify({
-          error: {
-            message: inner || `qoder billing block (${statusVal})`,
-            code: "qoder_billing_block",
-            status: 403,
-            type: "quota_error",
-          },
-        });
-        controller.enqueue(encoder.encode(`data: ${errObj}\n\n`));
-        controller.enqueue(encoder.encode(SSE_DONE));
-        doneEmitted = true;
-        return;
+        // Billing envelope at any stream position: abort with a structured
+        // provider error (same contract as the peek path). Throwing — instead
+        // of emitting any chunk — guarantees no "[qoder error ...]" assistant
+        // text can reach the client on any downstream path (SSE passthrough,
+        // SSE→JSON aggregation, non-streaming).
+        throw billingError(inner, statusVal);
       }
       const msg = inner || `upstream status ${statusVal}`;
       const errChunk = JSON.stringify({
@@ -555,8 +551,15 @@ async function wrapQoderSSE(response, model, log = null) {
             }
           }
         }
-      } catch {
-        // fall through to terminal [DONE] + close
+      } catch (err) {
+        if (err?.name === "QoderBillingError") {
+          // Billing aborts escape as real stream errors so chatCore fails the
+          // attempt (model lock + next account) instead of aggregating text.
+          try { controller.error(err); } catch { /* already closed */ }
+          await reader.cancel().catch(() => {});
+          return;
+        }
+        // Genuinely unexpected failures fall through to terminal [DONE] + close.
       } finally {
         if (!doneEmitted) {
           try {
