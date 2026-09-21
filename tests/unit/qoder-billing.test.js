@@ -82,6 +82,58 @@ describe("wrapQoderSSE billing detection", () => {
     expect(wrapped.ok).toBe(false);
   });
 
+  it("returns 403 response when first frame is billing block (code 110 string)", async () => {
+    const billingEnv = JSON.stringify({
+      statusCodeValue: 403,
+      body: '{"code":"110","message":"Billing daily count exceeded"}',
+    });
+    const upstream = `data: ${billingEnv}\n\n`;
+
+    const wrapped = await wrapQoderSSE(makeResponse([upstream]), "qoder/qfmodel");
+
+    expect(wrapped.status).toBe(403);
+    expect(wrapped.ok).toBe(false);
+    const json = await wrapped.json();
+    expect(json.error.message).toContain("Billing daily count exceeded");
+  });
+
+  it("returns 403 response when first frame is billing block (code 110 numeric)", async () => {
+    const billingEnv = JSON.stringify({
+      statusCodeValue: 403,
+      body: '{"code":110,"message":"Billing daily count exceeded"}',
+    });
+    const upstream = `data: ${billingEnv}\n\n`;
+
+    const wrapped = await wrapQoderSSE(makeResponse([upstream]), "qoder/qfmodel");
+
+    expect(wrapped.status).toBe(403);
+    expect(wrapped.ok).toBe(false);
+  });
+
+  it("does not treat legitimate assistant text mentioning code 110 as billing", async () => {
+    const inner = JSON.stringify({
+      choices: [{ delta: { content: "error 110 means billing daily count exceeded in docs" } }],
+    });
+    const successEnv = JSON.stringify({ statusCodeValue: 200, body: inner });
+    const upstream = `data: ${successEnv}\n\n`;
+
+    const wrapped = await wrapQoderSSE(makeResponse([upstream]), "qoder/qfmodel");
+
+    expect(wrapped.status).toBe(200);
+    const reader = wrapped.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+    }
+    buf += decoder.decode();
+
+    expect(buf).toContain("billing daily count exceeded");
+    expect(buf).not.toContain("[qoder error");
+  });
+
   it("returns 403 response when first frame has pricingUrl", async () => {
     const billingEnv = JSON.stringify({
       statusCodeValue: 402,
