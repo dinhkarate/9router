@@ -377,8 +377,8 @@ async function peekFirstQoderFrame(reader, decoder) {
 
     let envelope;
     try { envelope = JSON.parse(data); } catch { return { isBilling: false, consumed }; }
-    const statusVal = typeof envelope.statusCodeValue === "number" ? envelope.statusCodeValue : 200;
-    // Same extraction as processLine: body may be a JSON string or an object.
+    // statusCodeValue is documented numeric, but accept numeric strings defensively.
+    const statusVal = Number(envelope.statusCodeValue) || 200;
     const inner = typeof envelope.body === "string"
       ? envelope.body
       : envelope.body != null ? JSON.stringify(envelope.body) : "";
@@ -413,7 +413,7 @@ async function peekFirstQoderFrame(reader, decoder) {
  * If detected, return 403 response so chatCore marks connection unavailable
  * and triggers combo fallback instead of leaking error text into chat.
  */
-async function wrapQoderSSE(response, model) {
+async function wrapQoderSSE(response, model, log = null) {
   if (!response.ok || !response.body) return response;
 
   const decoder = new TextDecoder();
@@ -457,11 +457,16 @@ async function wrapQoderSSE(response, model) {
 
     let envelope;
     try { envelope = JSON.parse(data); } catch { return; }
-    const statusVal = typeof envelope.statusCodeValue === "number" ? envelope.statusCodeValue : 200;
+    const statusVal = Number(envelope.statusCodeValue) || 200;
     const inner = typeof envelope.body === "string"
       ? envelope.body
       : envelope.body != null ? JSON.stringify(envelope.body) : "";
     if (statusVal !== 200) {
+      // Debug the exact upstream envelope shape (types vary: numeric vs string
+        // status, string vs object body). Response bodies carry no credentials.
+      try {
+        log?.debug?.("QODER", `error envelope status=${statusVal} statusType=${typeof envelope.statusCodeValue} bodyType=${typeof envelope.body} body=${truncate(inner, 300)}`);
+      } catch { /* logging must not break the stream */ }
       if (isBillingBlock(inner)) {
         // Billing/quota envelope at any stream position (peek only covers the
         // first frame): emit a structured error chunk, not fake assistant text.
@@ -704,7 +709,7 @@ export class QoderExecutor extends BaseExecutor {
       return { response, url, headers, transformedBody: payload };
     }
 
-    const wrapped = await wrapQoderSSE(response, `qoder/${qoderKey}`);
+    const wrapped = await wrapQoderSSE(response, `qoder/${qoderKey}`, log);
     return { response: wrapped, url, headers, transformedBody: payload };
   }
 
