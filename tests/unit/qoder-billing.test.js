@@ -109,6 +109,53 @@ describe("wrapQoderSSE billing detection", () => {
     expect(wrapped.status).toBe(403);
     expect(wrapped.ok).toBe(false);
   });
+  it("returns 403 response when statusCodeValue is string \"403\" (code 110)", async () => {
+    const billingEnv = JSON.stringify({
+      statusCodeValue: "403",
+      body: '{"code":"110","message":"Billing daily count exceeded"}',
+    });
+    const upstream = `data: ${billingEnv}\n\n`;
+
+    const wrapped = await wrapQoderSSE(makeResponse([upstream]), "qoder/qfmodel");
+
+    expect(wrapped.status).toBe(403);
+    expect(wrapped.ok).toBe(false);
+    const json = await wrapped.json();
+    expect(json.error.message).toContain("Billing daily count exceeded");
+  });
+
+  it("emits structured 403 error chunk for object-body billing after a data frame (peek miss)", async () => {
+    const okEnv = JSON.stringify({
+      statusCodeValue: 200,
+      body: JSON.stringify({ choices: [{ delta: { content: "hi" } }] }),
+    });
+    const billingEnv = JSON.stringify({
+      statusCodeValue: 403,
+      body: { code: "110", message: "Billing daily count exceeded" },
+    });
+    const upstream = `data: ${okEnv}\n\ndata: ${billingEnv}\n\n`;
+
+    const wrapped = await wrapQoderSSE(makeResponse([upstream]), "qoder/qfmodel");
+
+    const reader = wrapped.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+    }
+    buf += decoder.decode();
+
+    expect(buf).not.toContain("[qoder error");
+    const errLine = buf.split("\n").find((l) => l.includes('"error"'));
+    expect(errLine).toBeDefined();
+    const errChunk = JSON.parse(errLine.slice(5).trim());
+    expect(errChunk.error.status).toBe(403);
+    expect(errChunk.error.message).toContain("Billing daily count exceeded");
+    expect(errChunk.choices).toBeUndefined();
+  });
+
 
   it("does not treat legitimate assistant text mentioning code 110 as billing", async () => {
     const inner = JSON.stringify({
